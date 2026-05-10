@@ -21,6 +21,9 @@ ENTWARE_DIR="$WORKDIR/Entware"
 PKGS_DIR="$WORKDIR/entware-packages"
 DL_DIR="$WORKDIR/dl"
 DOCKER_IMAGE="entware-builder"
+# UID/GID des Container-Users 'me' (fest im entware-builder Image)
+CONTAINER_UID=1000
+CONTAINER_GID=1000
 
 log() { printf '\033[1;32m[setup-build] %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31m[FEHLER] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -134,22 +137,33 @@ ln -snf "$PKGS_DIR/utils/gh" "$ENTWARE_DIR/package/utils/gh"
 
 # =============================================================================
 # PHASE 8: Paket bauen
-# --user root: entware-builder laeuft als 'me' (UID 1000), aber
-#              bind-gemountete Host-Dirs gehoeren root/admin.
+#
+# Hintergrund: GNU autoconf/configure (u.a. in tools/tar) verweigert den
+# Betrieb als root. --user root im Container schlaegt deshalb fehl.
+# Loesung: Arbeitsverzeichnis dem Container-User 'me' (UID/GID 1000)
+# gehoeren lassen, Container normal als 'me' starten, danach Ownership
+# zuruecksetzen.
 # =============================================================================
-log "Starte Build im Docker-Container (als root) ..."
+log "Setze Verzeichnis-Ownership fuer Container-User (UID $CONTAINER_UID) ..."
+chown -R "${CONTAINER_UID}:${CONTAINER_GID}" "$WORKDIR"
+
+# Cleanup-Trap: Ownership nach Build (oder Fehler) zurueck an aufrufenden User
+CALLER_UID=$(id -u)
+CALLER_GID=$(id -g)
+trap 'log "Setze Ownership zurueck auf ${CALLER_UID}:${CALLER_GID} ..."; chown -R "${CALLER_UID}:${CALLER_GID}" "$WORKDIR" 2>/dev/null || true' EXIT
+
+log "Starte Build im Docker-Container (als User me/UID $CONTAINER_UID) ..."
 
 docker run --rm \
-    --user root \
-    -v "$ENTWARE_DIR":/build/Entware \
-    -v "$DL_DIR":/build/dl \
+    -v "$ENTWARE_DIR":/home/me/Entware \
+    -v "$DL_DIR":/home/me/dl \
     -e CONFIG="$CONFIG" \
     "$DOCKER_IMAGE" \
     bash -c '
         set -e
-        cd /build/Entware
+        cd /home/me/Entware
         mkdir -p dl
-        for f in /build/dl/*; do
+        for f in /home/me/dl/*; do
             [ -f "$f" ] && ln -snf "$f" "dl/$(basename $f)" 2>/dev/null || true
         done
         if [ ! -d staging_dir ]; then
@@ -168,7 +182,7 @@ docker run --rm \
     '
 
 # =============================================================================
-# PHASE 9: .ipk sichern
+# PHASE 9: .ipk sichern (Ownership ist nach trap bereits zurueckgesetzt)
 # =============================================================================
 log "Suche fertige .ipk-Datei ..."
 IPK=$(find "$ENTWARE_DIR/bin" -name "gh_*.ipk" 2>/dev/null | head -1)
