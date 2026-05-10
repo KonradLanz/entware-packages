@@ -21,17 +21,12 @@ ENTWARE_DIR="$WORKDIR/Entware"
 PKGS_DIR="$WORKDIR/entware-packages"
 DL_DIR="$WORKDIR/dl"
 DOCKER_IMAGE="entware-builder"
-# UID/GID des Container-Users 'me' (fest im entware-builder Image)
 CONTAINER_UID=1000
 CONTAINER_GID=1000
 
 log() { printf '\033[1;32m[setup-build] %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31m[FEHLER] %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Config-Dateinamen entsprechen den tatsächlichen Entware configs/-Dateien:
-#   x86_64  -> configs/x64-3.2.config
-#   aarch64 -> configs/aarch64-3.10.config
-#   arm     -> configs/armv7-3.2.config
 case "$ARCH" in
     x86_64)  CONFIG="x64-3.2.config";       GH_SUFFIX="linux_amd64" ;;
     aarch64) CONFIG="aarch64-3.10.config";  GH_SUFFIX="linux_arm64" ;;
@@ -79,7 +74,6 @@ else
     git -C "$ENTWARE_DIR" pull --ff-only
 fi
 
-# Sanity-Check: Config-Datei muss existieren
 [ -f "$ENTWARE_DIR/configs/$CONFIG" ] || \
     die "Config nicht gefunden: $ENTWARE_DIR/configs/$CONFIG"
 
@@ -97,8 +91,14 @@ else
     git -C "$PKGS_DIR" pull --ff-only
 fi
 
+# gh-Paket-Verzeichnis fuer den Container vorbereiten
+# KEIN Symlink - direktes Bind-Mount im docker run, damit der Container
+# den Pfad /home/me/Entware/package/utils/gh tatsaechlich sieht.
+GH_PKG_SRC="$PKGS_DIR/utils/gh"
+[ -d "$GH_PKG_SRC" ] || die "gh-Paketverzeichnis nicht gefunden: $GH_PKG_SRC"
+
 # =============================================================================
-# PHASE 6: gh-Binary herunterladen & Hash via checksums.txt verifizieren
+# PHASE 6: gh-Binary herunterladen & Hash verifizieren
 # =============================================================================
 GH_BASE_URL="https://github.com/cli/cli/releases/download/v${PKG_VERSION}"
 GH_FILE="$DL_DIR/gh_${PKG_VERSION}_${GH_SUFFIX}.tar.gz"
@@ -125,64 +125,54 @@ if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
 fi
 log "SHA256 OK: $ACTUAL_HASH"
 
-# Symlink fuer den Entware-Build-Cache
-ln -snf "$GH_FILE" "$ENTWARE_DIR/dl/$(basename "$GH_FILE")"
+# =============================================================================
+# PHASE 7: Alten (fehlgeschlagenen) Build-State bereinigen
+# staging_dir vom vorherigen fehlgeschlagenen Build wuerde dazu fuehren,
+# dass tools/toolchain uebersprungen wird obwohl sie nie fertig wurden.
+# =============================================================================
+if [ -d "$ENTWARE_DIR/staging_dir" ]; then
+    log "Bereinige alten Build-State (staging_dir) ..."
+    rm -rf "$ENTWARE_DIR/staging_dir" "$ENTWARE_DIR/build_dir" "$ENTWARE_DIR/bin" "$ENTWARE_DIR/.config"
+fi
 
 # =============================================================================
-# PHASE 7: gh-Paket ins Buildsystem verlinken
-# =============================================================================
-log "Verlinke gh-Paket ins Buildsystem ..."
-mkdir -p "$ENTWARE_DIR/package/utils"
-ln -snf "$PKGS_DIR/utils/gh" "$ENTWARE_DIR/package/utils/gh"
-
-# =============================================================================
-# PHASE 8: Paket bauen
-#
-# Hintergrund: GNU autoconf/configure (u.a. in tools/tar) verweigert den
-# Betrieb als root. --user root im Container schlaegt deshalb fehl.
-# Loesung: Arbeitsverzeichnis dem Container-User 'me' (UID/GID 1000)
-# gehoeren lassen, Container normal als 'me' starten, danach Ownership
-# zuruecksetzen.
+# PHASE 8: Ownership setzen damit Container-User 'me' (UID 1000) schreiben kann
 # =============================================================================
 log "Setze Verzeichnis-Ownership fuer Container-User (UID $CONTAINER_UID) ..."
 chown -R "${CONTAINER_UID}:${CONTAINER_GID}" "$WORKDIR"
 
-# Cleanup-Trap: Ownership nach Build (oder Fehler) zurueck an aufrufenden User
 CALLER_UID=$(id -u)
 CALLER_GID=$(id -g)
 trap 'log "Setze Ownership zurueck auf ${CALLER_UID}:${CALLER_GID} ..."; chown -R "${CALLER_UID}:${CALLER_GID}" "$WORKDIR" 2>/dev/null || true' EXIT
 
-log "Starte Build im Docker-Container (als User me/UID $CONTAINER_UID) ..."
+# =============================================================================
+# PHASE 9: Paket bauen
+# gh-Paket wird als eigenes Volume direkt in den Entware-Package-Tree gemountet
+# - kein Symlink noetig, Container sieht den Pfad nativ
+# =============================================================================
+log "Starte Build im Docker-Container ..."
 
 docker run --rm \
     -v "$ENTWARE_DIR":/home/me/Entware \
-    -v "$DL_DIR":/home/me/dl \
+    -v "$DL_DIR":/home/me/Entware/dl \
+    -v "$GH_PKG_SRC":/home/me/Entware/package/utils/gh \
     -e CONFIG="$CONFIG" \
     "$DOCKER_IMAGE" \
     bash -c '
         set -e
         cd /home/me/Entware
-        mkdir -p dl
-        for f in /home/me/dl/*; do
-            [ -f "$f" ] && ln -snf "$f" "dl/$(basename $f)" 2>/dev/null || true
-        done
-        if [ ! -d staging_dir ]; then
-            cp "configs/$CONFIG" .config
-            echo CONFIG_PACKAGE_gh=m >> .config
-            make defconfig
-            make tools/install -j$(nproc)
-            make toolchain/install -j$(nproc)
-        else
-            echo CONFIG_PACKAGE_gh=m >> .config
-            make defconfig
-        fi
+        cp "configs/$CONFIG" .config
+        echo CONFIG_PACKAGE_gh=m >> .config
+        make defconfig
+        make tools/install -j$(nproc)
+        make toolchain/install -j$(nproc)
         make package/gh/compile -j$(nproc) V=s
         echo "=== Build erfolgreich ==="
         find bin -name "gh_*.ipk" 2>/dev/null
     '
 
 # =============================================================================
-# PHASE 9: .ipk sichern (Ownership ist nach trap bereits zurueckgesetzt)
+# PHASE 10: .ipk sichern
 # =============================================================================
 log "Suche fertige .ipk-Datei ..."
 IPK=$(find "$ENTWARE_DIR/bin" -name "gh_*.ipk" 2>/dev/null | head -1)
