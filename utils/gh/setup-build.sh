@@ -25,14 +25,18 @@ DOCKER_IMAGE="entware-builder"
 log() { printf '\033[1;32m[setup-build] %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31m[FEHLER] %s\033[0m\n' "$*" >&2; exit 1; }
 
+# Config-Dateinamen entsprechen den tatsächlichen Entware configs/-Dateien:
+#   x86_64  -> configs/x64-3.2.config
+#   aarch64 -> configs/aarch64-3.10.config
+#   arm     -> configs/armv7-3.2.config
 case "$ARCH" in
-    x86_64)  CONFIG="x86-64.config"; GH_SUFFIX="linux_amd64"  ;;
-    aarch64) CONFIG="aarch64.config"; GH_SUFFIX="linux_arm64"  ;;
-    arm)     CONFIG="armv7.config";   GH_SUFFIX="linux_armv6"  ;;
+    x86_64)  CONFIG="x64-3.2.config";       GH_SUFFIX="linux_amd64" ;;
+    aarch64) CONFIG="aarch64-3.10.config";  GH_SUFFIX="linux_arm64" ;;
+    arm)     CONFIG="armv7-3.2.config";     GH_SUFFIX="linux_armv6" ;;
     *) die "Unbekannte Architektur: $ARCH. Erlaubt: x86_64, aarch64, arm" ;;
 esac
 
-log "Ziel-Architektur: $ARCH ($GH_SUFFIX)"
+log "Ziel-Architektur: $ARCH  Config: $CONFIG  Binary: $GH_SUFFIX"
 
 # =============================================================================
 # PHASE 1: Abhängigkeiten prüfen
@@ -71,6 +75,10 @@ else
     log "Entware-Buildsystem bereits vorhanden, aktualisiere ..."
     git -C "$ENTWARE_DIR" pull --ff-only
 fi
+
+# Sanity-Check: Config-Datei muss existieren
+[ -f "$ENTWARE_DIR/configs/$CONFIG" ] || \
+    die "Config nicht gefunden: $ENTWARE_DIR/configs/$CONFIG"
 
 # =============================================================================
 # PHASE 5: entware-packages fork klonen
@@ -126,9 +134,8 @@ ln -snf "$PKGS_DIR/utils/gh" "$ENTWARE_DIR/package/utils/gh"
 
 # =============================================================================
 # PHASE 8: Paket bauen
-# Der entware-builder Container laeuft als User 'me' (UID 1000),
-# aber bind-gemountete Host-Verzeichnisse gehoeren root/admin.
-# --user root loest das Permission-Problem ohne Host-Verzeichnisse anzufassen.
+# --user root: entware-builder laeuft als 'me' (UID 1000), aber
+#              bind-gemountete Host-Dirs gehoeren root/admin.
 # =============================================================================
 log "Starte Build im Docker-Container (als root) ..."
 
@@ -142,12 +149,11 @@ docker run --rm \
         set -e
         cd /build/Entware
         mkdir -p dl
-        # dl-Symlinks in den Container-dl-Pfad zeigen lassen
         for f in /build/dl/*; do
             [ -f "$f" ] && ln -snf "$f" "dl/$(basename $f)" 2>/dev/null || true
         done
         if [ ! -d staging_dir ]; then
-            cp configs/$CONFIG .config
+            cp "configs/$CONFIG" .config
             echo CONFIG_PACKAGE_gh=m >> .config
             make defconfig
             make tools/install -j$(nproc)
