@@ -101,13 +101,10 @@ else
 fi
 
 log "Verifiziere SHA256 via checksums.txt ..."
-# Hash direkt aus der offiziellen checksums.txt lesen - kein grep-Trim-Problem
 EXPECTED_HASH=$(curl -sL "$CHECKSUMS_URL" | grep "gh_${PKG_VERSION}_${GH_SUFFIX}.tar.gz" | awk '{print $1}')
 ACTUAL_HASH=$(sha256sum "$GH_FILE" | awk '{print $1}')
 
-if [ -z "$EXPECTED_HASH" ]; then
-    die "Konnte Hash nicht aus checksums.txt lesen: $CHECKSUMS_URL"
-fi
+[ -z "$EXPECTED_HASH" ] && die "Konnte Hash nicht aus checksums.txt lesen: $CHECKSUMS_URL"
 
 if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
     printf '[FEHLER] SHA256-Mismatch!\n' >&2
@@ -118,7 +115,6 @@ fi
 log "SHA256 OK: $ACTUAL_HASH"
 
 # Symlink fuer den Entware-Build-Cache
-mkdir -p "$ENTWARE_DIR/dl"
 ln -snf "$GH_FILE" "$ENTWARE_DIR/dl/$(basename "$GH_FILE")"
 
 # =============================================================================
@@ -129,19 +125,27 @@ mkdir -p "$ENTWARE_DIR/package/utils"
 ln -snf "$PKGS_DIR/utils/gh" "$ENTWARE_DIR/package/utils/gh"
 
 # =============================================================================
-# PHASE 8: Paket bauen (Docker, nur Host-Bind-Mounts)
+# PHASE 8: Paket bauen
+# Der entware-builder Container laeuft als User 'me' (UID 1000),
+# aber bind-gemountete Host-Verzeichnisse gehoeren root/admin.
+# --user root loest das Permission-Problem ohne Host-Verzeichnisse anzufassen.
 # =============================================================================
-log "Starte Build im Docker-Container ..."
+log "Starte Build im Docker-Container (als root) ..."
 
 docker run --rm \
-    -v "$ENTWARE_DIR":/home/me/Entware \
-    -v "$DL_DIR":/home/me/Entware/dl \
-    -e ARCH="$ARCH" \
+    --user root \
+    -v "$ENTWARE_DIR":/build/Entware \
+    -v "$DL_DIR":/build/dl \
     -e CONFIG="$CONFIG" \
     "$DOCKER_IMAGE" \
     bash -c '
         set -e
-        cd /home/me/Entware
+        cd /build/Entware
+        mkdir -p dl
+        # dl-Symlinks in den Container-dl-Pfad zeigen lassen
+        for f in /build/dl/*; do
+            [ -f "$f" ] && ln -snf "$f" "dl/$(basename $f)" 2>/dev/null || true
+        done
         if [ ! -d staging_dir ]; then
             cp configs/$CONFIG .config
             echo CONFIG_PACKAGE_gh=m >> .config
@@ -163,9 +167,7 @@ docker run --rm \
 log "Suche fertige .ipk-Datei ..."
 IPK=$(find "$ENTWARE_DIR/bin" -name "gh_*.ipk" 2>/dev/null | head -1)
 
-if [ -z "$IPK" ]; then
-    die ".ipk nicht gefunden. Build fehlgeschlagen?"
-fi
+[ -z "$IPK" ] && die ".ipk nicht gefunden. Build fehlgeschlagen?"
 
 cp "$IPK" "$WORKDIR/"
 IPK_NAME=$(basename "$IPK")
@@ -175,10 +177,6 @@ log "=========================================================="
 log "Build abgeschlossen!"
 log "Paket: $WORKDIR/$IPK_NAME"
 printf '\n'
-log "Installieren:"
-log "  opkg install $WORKDIR/$IPK_NAME"
-printf '\n'
-log "Testen:"
-log "  gh --version"
-log "  gh auth login"
+log "Installieren:  opkg install $WORKDIR/$IPK_NAME"
+log "Testen:        gh --version"
 log "=========================================================="
