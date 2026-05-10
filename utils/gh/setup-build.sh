@@ -9,12 +9,16 @@
 #
 # Nutzung:
 #   chmod +x setup-build.sh
-#   ./setup-build.sh [x86_64|aarch64|arm]   (default: x86_64)
+#   ./setup-build.sh [x86_64|aarch64|arm]          (Vollbuild oder nur gh)
+#   ./setup-build.sh x86_64 --wipe-toolchain       (Toolchain erzwungen neu)
 # =============================================================================
 
 set -e
 
 ARCH="${1:-x86_64}"
+WIPE_TOOLCHAIN=0
+[ "${2:-}" = "--wipe-toolchain" ] && WIPE_TOOLCHAIN=1
+
 PKG_VERSION="2.72.0"
 WORKDIR="$(pwd)/entware-build"
 ENTWARE_DIR="$WORKDIR/Entware"
@@ -24,13 +28,17 @@ DOCKER_IMAGE="entware-builder"
 CONTAINER_UID=1000
 CONTAINER_GID=1000
 
-log() { printf '\033[1;32m[setup-build] %s\033[0m\n' "$*"; }
-die() { printf '\033[1;31m[FEHLER] %s\033[0m\n' "$*" >&2; exit 1; }
+log()  { printf '\033[1;32m[setup-build] %s\033[0m\n' "$*"; }
+info() { printf '\033[1;34m[setup-build] %s\033[0m\n' "$*"; }
+die()  { printf '\033[1;31m[FEHLER] %s\033[0m\n' "$*" >&2; exit 1; }
 
 case "$ARCH" in
-    x86_64)  CONFIG="x64-3.2.config";       GH_SUFFIX="linux_amd64" ;;
-    aarch64) CONFIG="aarch64-3.10.config";  GH_SUFFIX="linux_arm64" ;;
-    arm)     CONFIG="armv7-3.2.config";     GH_SUFFIX="linux_armv6" ;;
+    x86_64)  CONFIG="x64-3.2.config";       GH_SUFFIX="linux_amd64"
+             TOOLCHAIN_GCC="staging_dir/host/bin/x86_64-openwrt-linux-gnu-gcc" ;;
+    aarch64) CONFIG="aarch64-3.10.config";  GH_SUFFIX="linux_arm64"
+             TOOLCHAIN_GCC="staging_dir/host/bin/aarch64-openwrt-linux-gnu-gcc" ;;
+    arm)     CONFIG="armv7-3.2.config";     GH_SUFFIX="linux_armv6"
+             TOOLCHAIN_GCC="staging_dir/host/bin/arm-openwrt-linux-gnueabi-gcc" ;;
     *) die "Unbekannte Architektur: $ARCH. Erlaubt: x86_64, aarch64, arm" ;;
 esac
 
@@ -91,9 +99,6 @@ else
     git -C "$PKGS_DIR" pull --ff-only
 fi
 
-# gh-Paket-Verzeichnis fuer den Container vorbereiten
-# KEIN Symlink - direktes Bind-Mount im docker run, damit der Container
-# den Pfad /home/me/Entware/package/utils/gh tatsaechlich sieht.
 GH_PKG_SRC="$PKGS_DIR/utils/gh"
 [ -d "$GH_PKG_SRC" ] || die "gh-Paketverzeichnis nicht gefunden: $GH_PKG_SRC"
 
@@ -126,31 +131,58 @@ fi
 log "SHA256 OK: $ACTUAL_HASH"
 
 # =============================================================================
-# PHASE 7: Alten (fehlgeschlagenen) Build-State bereinigen
-# staging_dir vom vorherigen fehlgeschlagenen Build wuerde dazu fuehren,
-# dass tools/toolchain uebersprungen wird obwohl sie nie fertig wurden.
+# PHASE 7: Toolchain-Zustand pruefen
 # =============================================================================
-if [ -d "$ENTWARE_DIR/staging_dir" ]; then
-    log "Bereinige alten Build-State (staging_dir) ..."
-    rm -rf "$ENTWARE_DIR/staging_dir" "$ENTWARE_DIR/build_dir" "$ENTWARE_DIR/bin" "$ENTWARE_DIR/.config"
+TOOLCHAIN_OK=0
+if [ "$WIPE_TOOLCHAIN" = "1" ]; then
+    log "--wipe-toolchain: räume Toolchain auf ..."
+    rm -rf "$ENTWARE_DIR/staging_dir" "$ENTWARE_DIR/build_dir" \
+           "$ENTWARE_DIR/bin"         "$ENTWARE_DIR/.config"
+elif [ -x "$ENTWARE_DIR/$TOOLCHAIN_GCC" ]; then
+    info "Toolchain vorhanden ($TOOLCHAIN_GCC) — überspringe tools/toolchain."
+    TOOLCHAIN_OK=1
+else
+    log "Toolchain unvollständig oder fehlend — räume Build-State auf ..."
+    rm -rf "$ENTWARE_DIR/staging_dir" "$ENTWARE_DIR/build_dir" \
+           "$ENTWARE_DIR/bin"         "$ENTWARE_DIR/.config"
 fi
 
 # =============================================================================
-# PHASE 8: Ownership setzen damit Container-User 'me' (UID 1000) schreiben kann
+# PHASE 8: Ownership setzen
 # =============================================================================
-log "Setze Verzeichnis-Ownership fuer Container-User (UID $CONTAINER_UID) ..."
+log "Setze Verzeichnis-Ownership für Container-User (UID $CONTAINER_UID) ..."
 chown -R "${CONTAINER_UID}:${CONTAINER_GID}" "$WORKDIR"
 
 CALLER_UID=$(id -u)
 CALLER_GID=$(id -g)
-trap 'log "Setze Ownership zurueck auf ${CALLER_UID}:${CALLER_GID} ..."; chown -R "${CALLER_UID}:${CALLER_GID}" "$WORKDIR" 2>/dev/null || true' EXIT
+trap 'log "Setze Ownership zurück auf ${CALLER_UID}:${CALLER_GID} ..."; chown -R "${CALLER_UID}:${CALLER_GID}" "$WORKDIR" 2>/dev/null || true' EXIT
 
 # =============================================================================
-# PHASE 9: Paket bauen
-# gh-Paket wird als eigenes Volume direkt in den Entware-Package-Tree gemountet
-# - kein Symlink noetig, Container sieht den Pfad nativ
+# PHASE 9: Build im Container
 # =============================================================================
-log "Starte Build im Docker-Container ..."
+if [ "$TOOLCHAIN_OK" = "1" ]; then
+    info "Schnell-Build: nur gh-Paket wird neu kompiliert (~2-5 min) ..."
+    BUILD_CMD='set -e
+cd /home/me/Entware
+echo CONFIG_PACKAGE_gh=m >> .config
+make defconfig
+make package/gh/clean
+make package/gh/compile -j$(nproc) V=s
+echo "=== Build erfolgreich ==="
+find bin -name "gh_*.ipk" 2>/dev/null'
+else
+    log "Vollbuild: tools + toolchain + gh (~40-60 min beim ersten Mal) ..."
+    BUILD_CMD='set -e
+cd /home/me/Entware
+cp "configs/$CONFIG" .config
+echo CONFIG_PACKAGE_gh=m >> .config
+make defconfig
+make tools/install -j$(nproc)
+make toolchain/install -j$(nproc)
+make package/gh/compile -j$(nproc) V=s
+echo "=== Build erfolgreich ==="
+find bin -name "gh_*.ipk" 2>/dev/null'
+fi
 
 docker run --rm \
     -v "$ENTWARE_DIR":/home/me/Entware \
@@ -158,18 +190,7 @@ docker run --rm \
     -v "$GH_PKG_SRC":/home/me/Entware/package/utils/gh \
     -e CONFIG="$CONFIG" \
     "$DOCKER_IMAGE" \
-    bash -c '
-        set -e
-        cd /home/me/Entware
-        cp "configs/$CONFIG" .config
-        echo CONFIG_PACKAGE_gh=m >> .config
-        make defconfig
-        make tools/install -j$(nproc)
-        make toolchain/install -j$(nproc)
-        make package/gh/compile -j$(nproc) V=s
-        echo "=== Build erfolgreich ==="
-        find bin -name "gh_*.ipk" 2>/dev/null
-    '
+    bash -c "$BUILD_CMD"
 
 # =============================================================================
 # PHASE 10: .ipk sichern
