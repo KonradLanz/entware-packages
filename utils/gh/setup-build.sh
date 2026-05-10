@@ -4,7 +4,7 @@
 # Vollständiges Setup-Skript: Entware-Build-Umgebung + gh-Paket bauen
 #
 # Voraussetzungen:
-#   - Linux-Host (oder WSL2/NAS mit Docker) mit Docker
+#   - Linux-Host (oder WSL2/NAS mit Docker)
 #   - Git, curl
 #
 # Nutzung:
@@ -16,18 +16,15 @@ set -e
 
 ARCH="${1:-x86_64}"
 PKG_VERSION="2.72.0"
-# Arbeitsverzeichnis relativ zum Skript-Aufruf-Ort
 WORKDIR="$(pwd)/entware-build"
 ENTWARE_DIR="$WORKDIR/Entware"
 PKGS_DIR="$WORKDIR/entware-packages"
 DL_DIR="$WORKDIR/dl"
 DOCKER_IMAGE="entware-builder"
 
-# printf statt echo für ANSI-Farben (busybox-kompatibel)
 log() { printf '\033[1;32m[setup-build] %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31m[FEHLER] %s\033[0m\n' "$*" >&2; exit 1; }
 
-# --- Architektur-spezifische Einstellungen ---
 case "$ARCH" in
     x86_64)  CONFIG="x86-64.config"; GH_SUFFIX="linux_amd64"  ;;
     aarch64) CONFIG="aarch64.config"; GH_SUFFIX="linux_arm64"  ;;
@@ -65,7 +62,7 @@ else
 fi
 
 # =============================================================================
-# PHASE 4: Entware-Buildsystem klonen (falls nicht vorhanden)
+# PHASE 4: Entware-Buildsystem klonen
 # =============================================================================
 if [ ! -d "$ENTWARE_DIR/.git" ]; then
     log "Klone Entware-Buildsystem ..."
@@ -76,7 +73,7 @@ else
 fi
 
 # =============================================================================
-# PHASE 5: entware-packages fork klonen (falls nicht vorhanden)
+# PHASE 5: entware-packages fork klonen
 # =============================================================================
 if [ ! -d "$PKGS_DIR/.git" ]; then
     log "Klone entware-packages Fork ..."
@@ -90,41 +87,49 @@ else
 fi
 
 # =============================================================================
-# PHASE 6: gh-Binary vorab herunterladen & Hash verifizieren
+# PHASE 6: gh-Binary herunterladen & Hash via checksums.txt verifizieren
 # =============================================================================
-GH_URL="https://github.com/cli/cli/releases/download/v${PKG_VERSION}/gh_${PKG_VERSION}_${GH_SUFFIX}.tar.gz"
+GH_BASE_URL="https://github.com/cli/cli/releases/download/v${PKG_VERSION}"
 GH_FILE="$DL_DIR/gh_${PKG_VERSION}_${GH_SUFFIX}.tar.gz"
-
-# Hash aus Makefile lesen (ifeq-Block für passende Architektur)
-EXPECTED_HASH=$(grep -A2 "PKG_ARCH_SUFFIX:=${GH_SUFFIX}" "$PKGS_DIR/utils/gh/Makefile" | grep 'PKG_HASH' | cut -d= -f2)
+CHECKSUMS_URL="${GH_BASE_URL}/gh_${PKG_VERSION}_checksums.txt"
 
 if [ ! -f "$GH_FILE" ]; then
     log "Lade gh v$PKG_VERSION ($GH_SUFFIX) herunter ..."
-    curl -L --progress-bar "$GH_URL" -o "$GH_FILE"
+    curl -L --progress-bar "${GH_BASE_URL}/gh_${PKG_VERSION}_${GH_SUFFIX}.tar.gz" -o "$GH_FILE"
 else
     log "gh-Archiv bereits vorhanden: $GH_FILE"
 fi
 
-log "Verifiziere SHA256 ..."
-ACTUAL_HASH=$(sha256sum "$GH_FILE" | cut -d' ' -f1)
+log "Verifiziere SHA256 via checksums.txt ..."
+# Hash direkt aus der offiziellen checksums.txt lesen - kein grep-Trim-Problem
+EXPECTED_HASH=$(curl -sL "$CHECKSUMS_URL" | grep "gh_${PKG_VERSION}_${GH_SUFFIX}.tar.gz" | awk '{print $1}')
+ACTUAL_HASH=$(sha256sum "$GH_FILE" | awk '{print $1}')
+
+if [ -z "$EXPECTED_HASH" ]; then
+    die "Konnte Hash nicht aus checksums.txt lesen: $CHECKSUMS_URL"
+fi
+
 if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
-    die "SHA256-Mismatch!\n  Erwartet: $EXPECTED_HASH\n  Erhalten: $ACTUAL_HASH"
+    printf '[FEHLER] SHA256-Mismatch!\n' >&2
+    printf '  Erwartet: %s\n' "$EXPECTED_HASH" >&2
+    printf '  Erhalten: %s\n' "$ACTUAL_HASH" >&2
+    exit 1
 fi
 log "SHA256 OK: $ACTUAL_HASH"
 
-# Symlink damit der Entware-Build-Cache die Datei findet
+# Symlink fuer den Entware-Build-Cache
 mkdir -p "$ENTWARE_DIR/dl"
-ln -snf "$GH_FILE" "$ENTWARE_DIR/dl/$(basename $GH_FILE)"
+ln -snf "$GH_FILE" "$ENTWARE_DIR/dl/$(basename "$GH_FILE")"
 
 # =============================================================================
-# PHASE 7: Pakete im Entware-Buildsystem verlinken
+# PHASE 7: gh-Paket ins Buildsystem verlinken
 # =============================================================================
 log "Verlinke gh-Paket ins Buildsystem ..."
 mkdir -p "$ENTWARE_DIR/package/utils"
 ln -snf "$PKGS_DIR/utils/gh" "$ENTWARE_DIR/package/utils/gh"
 
 # =============================================================================
-# PHASE 8: Paket bauen (im Docker-Container, nur Host-Bind-Mounts)
+# PHASE 8: Paket bauen (Docker, nur Host-Bind-Mounts)
 # =============================================================================
 log "Starte Build im Docker-Container ..."
 
@@ -134,28 +139,26 @@ docker run --rm \
     -e ARCH="$ARCH" \
     -e CONFIG="$CONFIG" \
     "$DOCKER_IMAGE" \
-    bash -c "
+    bash -c '
         set -e
         cd /home/me/Entware
-
         if [ ! -d staging_dir ]; then
-            cp configs/\$CONFIG .config
-            echo 'CONFIG_PACKAGE_gh=m' >> .config
+            cp configs/$CONFIG .config
+            echo CONFIG_PACKAGE_gh=m >> .config
             make defconfig
-            make tools/install -j\$(nproc)
-            make toolchain/install -j\$(nproc)
+            make tools/install -j$(nproc)
+            make toolchain/install -j$(nproc)
         else
-            echo 'CONFIG_PACKAGE_gh=m' >> .config
+            echo CONFIG_PACKAGE_gh=m >> .config
             make defconfig
         fi
-
-        make package/gh/compile -j\$(nproc) V=s
-        echo '=== Build erfolgreich ==='
-        find bin -name 'gh_*.ipk' 2>/dev/null
-    "
+        make package/gh/compile -j$(nproc) V=s
+        echo "=== Build erfolgreich ==="
+        find bin -name "gh_*.ipk" 2>/dev/null
+    '
 
 # =============================================================================
-# PHASE 9: .ipk-Datei sichern
+# PHASE 9: .ipk sichern
 # =============================================================================
 log "Suche fertige .ipk-Datei ..."
 IPK=$(find "$ENTWARE_DIR/bin" -name "gh_*.ipk" 2>/dev/null | head -1)
@@ -168,11 +171,11 @@ cp "$IPK" "$WORKDIR/"
 IPK_NAME=$(basename "$IPK")
 
 printf '\n'
-log "=================================================="
+log "=========================================================="
 log "Build abgeschlossen!"
 log "Paket: $WORKDIR/$IPK_NAME"
 printf '\n'
-log "Auf QNAP installieren (direkt, da du schon drauf bist):"
+log "Installieren:"
 log "  opkg install $WORKDIR/$IPK_NAME"
 printf '\n'
 log "Testen:"
