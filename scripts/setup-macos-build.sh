@@ -1,44 +1,27 @@
 #!/usr/bin/env bash
 # setup-macos-build.sh
 # Sets up the Entware build environment on macOS (Apple Silicon + Intel)
-# Usage: bash scripts/setup-macos-build.sh
+# Does NOT permanently modify ~/.zshrc or PATH.
+#
+# Usage (once):
+#   bash scripts/setup-macos-build.sh
+#
+# Before every build session:
+#   source scripts/entware-build-env.sh
+#   cd /Volumes/EntwareBuild/Entware
 
 set -euo pipefail
 
-INAGE_PATH="$HOME/entware-build/entware.sparseimage"
+IMAGE_PATH="$HOME/entware-build/entware.sparseimage"
 VOLUME="/Volumes/EntwareBuild"
 SIZE="20g"
+ENV_SCRIPT="$(dirname "$0")/entware-build-env.sh"
 
 echo "==> Installing required Homebrew packages..."
 brew install \
     make coreutils findutils gnu-sed gawk \
     gnu-tar patch diffutils gnu-getopt \
     gettext openssl@3 python3 wget xz
-
-echo "==> Setting up GNU tools PATH..."
-export PATH="/opt/homebrew/opt/make/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/findutils/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/gawk/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/gnu-tar/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/gnu-getopt/bin:$PATH"
-
-# Persist to ~/.zshrc if not already there
-if ! grep -q 'Entware build' ~/.zshrc 2>/dev/null; then
-    echo "==> Adding GNU tools to ~/.zshrc..."
-    cat >> ~/.zshrc << 'EOF'
-
-# GNU tools for Entware build (added by setup-macos-build.sh)
-export PATH="/opt/homebrew/opt/make/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/findutils/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/gawk/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/gnu-tar/libexec/gnubin:$PATH"
-export PATH="/opt/homebrew/opt/gnu-getopt/bin:$PATH"
-EOF
-fi
 
 # Create case-sensitive disk image if not already present
 if [ ! -f "$IMAGE_PATH" ]; then
@@ -47,7 +30,7 @@ if [ ! -f "$IMAGE_PATH" ]; then
     hdiutil create -size "$SIZE" -type SPARSE -fs "Case-sensitive HFS+" \
         -volname EntwareBuild "$IMAGE_PATH"
 else
-    echo "==> Disk image already exists at $IMAGE_PATH, skipping creation."
+    echo "==> Disk image already exists, skipping creation."
 fi
 
 # Mount if not already mounted
@@ -66,14 +49,31 @@ else
     echo "==> Entware SDK already present, skipping clone."
 fi
 
+# Generate the local env script (not sourced permanently anywhere)
+cat > "$ENV_SCRIPT" << 'EOF'
+#!/usr/bin/env bash
+# entware-build-env.sh
+# Activates GNU tools for the current shell session ONLY.
+# Source this before building: source scripts/entware-build-env.sh
+# Your PATH reverts to normal when you close the terminal.
+
+export PATH="/opt/homebrew/opt/make/libexec/gnubin:$PATH"
+export PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH"
+export PATH="/opt/homebrew/opt/findutils/libexec/gnubin:$PATH"
+export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
+export PATH="/opt/homebrew/opt/gawk/libexec/gnubin:$PATH"
+export PATH="/opt/homebrew/opt/gnu-tar/libexec/gnubin:$PATH"
+export PATH="/opt/homebrew/opt/gnu-getopt/bin:$PATH"
+
+echo "Entware build env active (this session only)."
+echo "cd /Volumes/EntwareBuild/Entware to start building."
+EOF
+chmod +x "$ENV_SCRIPT"
+
 echo ""
-echo "==> Setup complete! Now run:"
+echo "==> Setup complete! For every build session:"
 echo ""
-echo "    cd $VOLUME/Entware"
-echo "    cp configs/x64-3.2.config .config"
-echo "    make defconfig"
-echo "    echo 'src-git konrad https://github.com/KonradLanz/entware-packages.git;add-rmlint' >> feeds.conf"
-echo "    make package/feeds/update"
-echo "    make package/feeds/install"
+echo "    source scripts/entware-build-env.sh"
+echo "    cd /Volumes/EntwareBuild/Entware"
 echo "    make package/rmlint/compile V=s -j\$(nproc)"
 echo ""
